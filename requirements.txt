@@ -1,0 +1,9 @@
+streamlit
+tensorflow
+numpy
+nibabel
+scipy
+requests
+print("Added 'requests' to requirements.txt")
+requests
+print("Added 'requests' to requirements.txt")
