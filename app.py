@@ -7,11 +7,11 @@ import tempfile
 import os
 import shutil
 import requests # Import requests library
+import re # Import re for potential regex use in Google Drive download logic
 
 # --- Constants ---
 # IMPORTANT: Replace this with your actual Google Drive direct download URL
-# For example: "https://docs.google.com/uc?export=download&id=YOUR_FILE_ID"
-MODEL_DOWNLOAD_URL = "https://drive.google.com/uc?export=download&id=134y3Q2sfXoBxDiwhZ4wIbXPSO-vHl8e8" # Updated with your model's direct download URL
+MODEL_DOWNLOAD_URL = "https://drive.google.com/uc?export=download&id=134y3Q2sfXoBxDiwhZ4wIbXPSO-vHl8e8"
 
 OPTIMAL_THRESHOLD = 0.2
 TARGET_SHAPE = (64, 64, 64)
@@ -55,30 +55,82 @@ def preprocess_single_nii(nii_file_path, target_shape=TARGET_SHAPE, normalizatio
 def load_model_from_url(model_url):
     """
     Downloads a model from a URL to a temporary file and then loads it.
+    Robustly handles Google Drive large file downloads.
     """
-    st.info("Downloading model...")
+    st.info("Attempting to download model...")
+    tmp_path = None # Initialize tmp_path outside try block
+
     try:
-        response = requests.get(model_url, stream=True)
+        session = requests.Session()
+        response = session.get(model_url, stream=True)
         response.raise_for_status() # Raise an exception for HTTP errors
 
-        # Use NamedTemporaryFile to create a temporary file to store the model
+        # Check for Google Drive download confirmation page (common for large files)
+        if "Content-Disposition" not in response.headers and "text/html" in response.headers.get("Content-Type", ""):
+            match = re.search(r"confirm=([0-9A-Za-z_]+)", response.text)
+            if match:
+                confirm_token = match.group(1)
+                st.info("Google Drive download requires confirmation. Getting confirmation token...")
+                download_url_with_confirm = model_url + "&confirm=" + confirm_token
+                response = session.get(download_url_with_confirm, stream=True)
+                response.raise_for_status()
+            else:
+                st.error("Google Drive download failed: Could not find confirmation token or direct download.")
+                return None
+
+        st.info("Downloading model to temporary file...")
         with tempfile.NamedTemporaryFile(delete=False, suffix='.keras') as tmp_file:
             for chunk in response.iter_content(chunk_size=8192):
                 tmp_file.write(chunk)
-            tmp_path = tmp_file.name
+            tmp_path = tmp_file.name # Store the path
+        
+        # Explicitly close the temporary file before TensorFlow tries to open it
+        # The 'with' statement handles closing, but for delete=False and subsequent tf.keras.models.load_model,
+        # ensuring the file is fully flushed and closed before another process (TF) opens it is good practice.
+        # The 'with' block already ensures the file is closed upon exit.
+
         st.success(f"Model downloaded to {tmp_path}")
+        file_size_bytes = os.path.getsize(tmp_path)
+        st.info(f"Downloaded file size: {file_size_bytes / (1024 * 1024):.2f} MB")
+        
+        # Add a check for file existence and content before loading
+        if not os.path.exists(tmp_path):
+            st.error(f"Error: Downloaded file does not exist at {tmp_path}")
+            return None
+        
+        # Try to load the model
         model = tf.keras.models.load_model(tmp_path)
         st.success("Model loaded successfully!")
-        # Optional: Delete temporary file after loading if memory permits and model is cached.
-        # For st.cache_resource, the model itself is cached, so the file can be deleted.
-        os.remove(tmp_path)
         return model
+
     except requests.exceptions.RequestException as e:
-        st.error(f"Failed to download model: {e}")
+        st.error(f"Failed to download model (HTTP/Network error): {e}")
+        if tmp_path and os.path.exists(tmp_path):
+            st.error(f"Temporary file might be at {tmp_path}. Size: {os.path.getsize(tmp_path) / (1024 * 1024):.2f} MB")
         return None
     except Exception as e:
         st.error(f"Error loading model from downloaded file: {e}")
+        st.error(f"Attempted to load from: {tmp_path}")
+        if tmp_path and os.path.exists(tmp_path):
+            file_size_bytes = os.path.getsize(tmp_path)
+            st.error(f"File exists at {tmp_path} with size {file_size_bytes / (1024 * 1024):.2f} MB")
+            # Optional: print first few lines of the file to check for HTML content if it's small
+            if file_size_bytes > 0 and file_size_bytes < 1024 * 1024: # Check if it's less than 1MB to avoid printing huge files
+                try:
+                    with open(tmp_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        first_lines = f.read(500) # Read first 500 characters
+                        if "<html" in first_lines.lower() or "<!doctype html>" in first_lines.lower():
+                            st.error("WARNING: Downloaded file appears to be an HTML page, not a Keras model. "
+                                     "This often means Google Drive required confirmation or a different download method.")
+                        else:
+                            st.info(f"First 500 chars of file: {first_lines}")
+                except Exception as file_read_e:
+                    st.error(f"Could not read temporary file for inspection: {file_read_e}")
         return None
+    finally:
+        # Clean up temporary file if it was created and delete=False
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 # --- Streamlit Application ---
 st.title('3D CNN Cancer Classification')
